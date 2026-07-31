@@ -1,0 +1,32 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --add-data "templates;templates" --add-data "static;static" --add-data "midi_generator.py;." --hidden-import sklearn --hidden-import librosa --hidden-import numpy --hidden-import scipy --hidden-import fastdtw --hidden-import pretty_midi --hidden-import flask --hidden-import flask_cors --name "视唱评分" app.py
+
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: sight-singing-windows
+        path: dist/视唱评分.exe
