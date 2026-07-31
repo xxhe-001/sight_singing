@@ -1,0 +1,7 @@
+Flask==2.3.3
+flask-cors==4.0.0
+numpy==1.24.3
+librosa==0.10.1
+pretty_midi==0.2.10
+fastdtw==0.3.4
+natsort==8.4.0

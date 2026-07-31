@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视唱评分系统</title>
+    <!-- PWA 必需标签 -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#3498db">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/abcjs@6.2.3/dist/abcjs-basic-min.js"></script>
+</head>
+<body>
+    <h1>🎵 视唱评分系统</h1>
+
+    <div class="card">
+        <h3>📂 选择曲目</h3>
+        <div id="score-list" class="score-list">加载中...</div>
+    </div>
+
+    <div class="card">
+        <h3>🎙️ 录制演唱</h3>
+        <div class="recording-controls">
+            <button id="btn-main-action" class="btn btn-primary" disabled>开始</button>
+            <button id="btn-stop" class="btn btn-danger" style="display:none;">停止录音</button>
+            <span id="countdown" style="display:none; font-size: 48px; font-weight: bold; color: #e74c3c; margin: 0 20px;"></span>
+            <span id="timer" style="display:none;">00:00</span>
+        </div>
+        <div id="score-abc" style="display:none; margin-top: 15px;"></div>
+        <div id="status">请先选择一首曲目，然后点击"开始"查看曲谱并录音。</div>
+    </div>
+
+    <div class="card" id="result-card" style="display:none;">
+        <h3>📊 评分结果</h3>
+        <div id="result-score-abc" style="margin-bottom: 20px;"></div>
+        <div id="result-content"></div>
+    </div>
+
+    <script>
+        // ============================================================
+        // 全局状态
+        // ============================================================
+        let selectedMidi = null;
+        let selectedMidiName = null;
+        let isRecording = false;
+        let countdownInterval = null;
+        let timerInterval = null;
+        let recordingStartTime = 0;
+        let mediaStream = null;
+        let audioContext = null;
+        let scriptProcessor = null;
+        let pcmData = [];
+        let originalAbcText = '';
+
+        const scoreListEl = document.getElementById('score-list');
+        const abcDiv = document.getElementById('score-abc');
+        const btnMainAction = document.getElementById('btn-main-action');
+        const btnStop = document.getElementById('btn-stop');
+        const countdownEl = document.getElementById('countdown');
+        const timerEl = document.getElementById('timer');
+        const statusEl = document.getElementById('status');
+        const resultCard = document.getElementById('result-card');
+        const resultScoreAbc = document.getElementById('result-score-abc');
+        const resultContent = document.getElementById('result-content');
+
+        // ============================================================
+        // 加载曲目列表
+        // ============================================================
+        async function loadScores() {
+            try {
+                const res = await fetch('/api/scores');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                let data = await res.json();
+                if (!Array.isArray(data) || data.length === 0) {
+                    scoreListEl.innerHTML = '暂无曲目，请将 MIDI 文件放入 test_data/scores/';
+                    return;
+                }
+                // 前端二次排序（保证数字顺序）
+                data.sort((a, b) => a.name.localeCompare(b.name, 'zh', { numeric: true }));
+
+                let html = '';
+                data.forEach(function(item) {
+                    html += '<div class="score-item" data-filename="' + item.filename + '" data-name="' + item.name + '">' + item.name + '</div>';
+                });
+                scoreListEl.innerHTML = html;
+
+                document.querySelectorAll('.score-item').forEach(function(el) {
+                    el.addEventListener('click', function() {
+                        document.querySelectorAll('.score-item').forEach(function(c) { c.classList.remove('active'); });
+                        this.classList.add('active');
+                        selectedMidi = this.dataset.filename;
+                        selectedMidiName = this.dataset.name;
+                        resetUI();
+                        btnMainAction.disabled = false;
+                        btnMainAction.textContent = '开始';
+                        btnMainAction.className = 'btn btn-primary';
+                        statusEl.textContent = '已选择: ' + this.dataset.name + ' - 点击"开始"查看曲谱并开始录音';
+                        statusEl.className = '';
+                    });
+                });
+                
+                var first = document.querySelector('.score-item');
+                if (first) {
+                    first.click();
+                    selectedMidiName = first.dataset.name;
+                }
+            } catch (e) {
+                console.error('加载曲目失败:', e);
+                scoreListEl.textContent = '加载失败: ' + e.message;
+                statusEl.textContent = '加载失败，请刷新重试。';
+                statusEl.className = 'error';
+            }
+        }
+
+        // ============================================================
+        // UI重置
+        // ============================================================
+        function resetUI() {
+            abcDiv.style.display = 'none';
+            abcDiv.innerHTML = '';
+            resultCard.style.display = 'none';
+            resultScoreAbc.innerHTML = '';
+            resultContent.innerHTML = '';
+            countdownEl.style.display = 'none';
+            timerEl.style.display = 'none';
+            btnStop.style.display = 'none';
+            btnMainAction.style.display = 'inline-block';
+            btnMainAction.textContent = '开始';
+            btnMainAction.className = 'btn btn-primary';
+            btnMainAction.disabled = false;
+            if (countdownInterval) clearInterval(countdownInterval);
+            if (timerInterval) clearInterval(timerInterval);
+        }
+
+        // ============================================================
+        // 获取并显示五线谱
+        // ============================================================
+        async function getAbcText(filename) {
+            try {
+                const abcRes = await fetch('/api/score/' + filename + '/abc');
+                if (!abcRes.ok) throw new Error('ABC 生成失败');
+                return await abcRes.text();
+            } catch (e) {
+                console.error('获取ABC失败:', e);
+                return null;
+            }
+        }
+
+        async function renderScore(container, abcText, noteResults = null) {
+            if (!abcText) {
+                container.innerHTML = '⚠️ 五线谱生成失败';
+                return;
+            }
+            
+            container.innerHTML = '';
+            container.style.display = 'block';
+            
+            ABCJS.renderAbc(container, abcText, {
+                responsive: false,
+                scale: 1.0,
+                add_classes: true,
+                displayMeasureNumbers: true
+            });
+            
+            if (noteResults && noteResults.length > 0) {
+                setTimeout(() => {
+                    markErrorsOnScore(container, noteResults);
+                }, 800);
+            }
+        }
+
+        async function showScore(filename) {
+            originalAbcText = await getAbcText(filename);
+            await renderScore(abcDiv, originalAbcText);
+        }
+
+        // ============================================================
+        // 主操作按钮处理
+        // ============================================================
+        async function handleMainAction() {
+            if (isRecording) return;
+            await startProcess();
+        }
+
+        async function startProcess() {
+            if (!selectedMidi) {
+                statusEl.textContent = '请先选择曲目！';
+                statusEl.className = 'error';
+                return;
+            }
+
+            cleanupRecording();
+            
+            resultCard.style.display = 'none';
+            resultScoreAbc.innerHTML = '';
+            resultContent.innerHTML = '';
+            
+            statusEl.textContent = '📖 曲谱显示中，准备录音...';
+            statusEl.className = '';
+            await showScore(selectedMidi);
+
+            btnMainAction.disabled = true;
+            btnMainAction.textContent = '准备中...';
+            btnMainAction.style.display = 'inline-block';
+            btnStop.style.display = 'none';
+            countdownEl.style.display = 'inline';
+            timerEl.style.display = 'none';
+            
+            let countdown = 10;
+            countdownEl.textContent = countdown;
+            
+            if (countdownInterval) clearInterval(countdownInterval);
+            countdownInterval = setInterval(() => {
+                countdown--;
+                countdownEl.textContent = countdown;
+                if (countdown <= 0) {
+                    clearInterval(countdownInterval);
+                    countdownEl.style.display = 'none';
+                    startRecording();
+                }
+            }, 1000);
+        }
+
+        // ============================================================
+        // 清理录音资源
+        // ============================================================
+        function cleanupRecording() {
+            if (countdownInterval) clearInterval(countdownInterval);
+            if (timerInterval) clearInterval(timerInterval);
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(function(t) { t.stop(); });
+                mediaStream = null;
+            }
+            isRecording = false;
+            pcmData = [];
+        }
+
+        // ============================================================
+        // 开始录音
+        // ============================================================
+        async function startRecording() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                source.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                pcmData = [];
+                isRecording = true;
+                recordingStartTime = Date.now();
+                
+                btnMainAction.style.display = 'none';
+                btnStop.style.display = 'inline-block';
+                timerEl.style.display = 'inline';
+                statusEl.textContent = '🎤 录音中... 点击"停止录音"结束';
+                statusEl.className = '';
+
+                scriptProcessor.onaudioprocess = function(e) {
+                    if (isRecording) {
+                        var input = e.inputBuffer.getChannelData(0);
+                        pcmData.push(new Float32Array(input));
+                    }
+                };
+
+                if (timerInterval) clearInterval(timerInterval);
+                timerInterval = setInterval(function() {
+                    var elapsed = (Date.now() - recordingStartTime) / 1000;
+                    var mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+                    var secs = String(Math.floor(elapsed % 60)).padStart(2, '0');
+                    timerEl.textContent = mins + ':' + secs;
+                }, 500);
+
+            } catch (err) {
+                statusEl.textContent = '无法访问麦克风: ' + err.message;
+                statusEl.className = 'error';
+                btnMainAction.style.display = 'inline-block';
+                btnMainAction.disabled = false;
+                btnMainAction.textContent = '重新开始';
+                btnStop.style.display = 'none';
+            }
+        }
+
+        // ============================================================
+        // 停止录音
+        // ============================================================
+        function stopRecording() {
+            if (!isRecording) return;
+            isRecording = false;
+            
+            if (timerInterval) clearInterval(timerInterval);
+            timerEl.style.display = 'none';
+            
+            btnStop.style.display = 'none';
+            btnMainAction.style.display = 'inline-block';
+            btnMainAction.disabled = true;
+            btnMainAction.textContent = '评分中...';
+            statusEl.textContent = '⏳ 录音结束，正在评分...';
+            statusEl.className = '';
+
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(function(t) { t.stop(); });
+                mediaStream = null;
+            }
+
+            if (pcmData.length > 0) {
+                var totalLength = pcmData.reduce(function(acc, chunk) { return acc + chunk.length; }, 0);
+                var combined = new Float32Array(totalLength);
+                var offset = 0;
+                for (var i = 0; i < pcmData.length; i++) {
+                    combined.set(pcmData[i], offset);
+                    offset += pcmData[i].length;
+                }
+
+                var wavBlob = createWavBlob(combined, 44100);
+                uploadAudio(wavBlob);
+            } else {
+                statusEl.textContent = '没有录制到音频数据';
+                statusEl.className = 'error';
+                btnMainAction.disabled = false;
+                btnMainAction.textContent = '重新开始';
+            }
+        }
+
+        function createWavBlob(float32Array, sampleRate) {
+            var numSamples = float32Array.length;
+            var numChannels = 1;
+            var bitsPerSample = 16;
+            var byteRate = sampleRate * numChannels * bitsPerSample / 8;
+            var blockAlign = numChannels * bitsPerSample / 8;
+            var dataSize = numSamples * blockAlign;
+            var headerSize = 44;
+            var totalSize = headerSize + dataSize;
+
+            var buffer = new ArrayBuffer(totalSize);
+            var view = new DataView(buffer);
+
+            function writeString(view, offset, str) {
+                for (var i = 0; i < str.length; i++) {
+                    view.setUint8(offset + i, str.charCodeAt(i));
+                }
+            }
+
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, totalSize - 8, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitsPerSample, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            var offsetByte = 44;
+            for (var i = 0; i < numSamples; i++) {
+                var val = float32Array[i];
+                val = Math.max(-1, Math.min(1, val));
+                var int16 = val < 0 ? val * 0x8000 : val * 0x7FFF;
+                view.setInt16(offsetByte, int16, true);
+                offsetByte += 2;
+            }
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+
+        async function uploadAudio(wavBlob) {
+            var formData = new FormData();
+            formData.append('audio', wavBlob, 'recording.wav');
+            formData.append('midi', selectedMidi);
+
+            statusEl.textContent = '📤 上传并评分中...';
+            statusEl.className = '';
+
+            try {
+                var res = await fetch('/api/evaluate', {
+                    method: 'POST',
+                    body: formData
+                });
+                var result = await res.json();
+                if (result.error) {
+                    statusEl.textContent = '评分失败: ' + result.error;
+                    statusEl.className = 'error';
+                    btnMainAction.disabled = false;
+                    btnMainAction.textContent = '重新开始';
+                    return;
+                }
+                statusEl.textContent = '✅ 评分完成！点击"重新开始"再次录音';
+                btnMainAction.disabled = false;
+                btnMainAction.textContent = '重新开始';
+                await displayResult(result);
+            } catch (err) {
+                statusEl.textContent = '请求失败: ' + err.message;
+                statusEl.className = 'error';
+                btnMainAction.disabled = false;
+                btnMainAction.textContent = '重新开始';
+            }
+        }
+
+        // ============================================================
+        // 显示结果，在五线谱上标记错误
+        // ============================================================
+        async function displayResult(result) {
+            resultCard.style.display = 'block';
+            
+            if (selectedMidi) {
+                const abcText = await getAbcText(selectedMidi);
+                await renderScore(resultScoreAbc, abcText, result.note_results);
+            }
+            
+            var overall = result.overall_score || 0;
+            var scoreClass = 'score-bad';
+            if (overall >= 80) scoreClass = 'score-good';
+            else if (overall >= 60) scoreClass = 'score-ok';
+
+            var html = '';
+            html += '<div class="result-score ' + scoreClass + '">综合得分: ' + overall.toFixed(1) + ' / 100</div>';
+            html += '<div>音准: ' + (result.pitch_score || 0).toFixed(1) + ' &nbsp;|&nbsp; 节奏: ' + (result.rhythm_score || 0).toFixed(1) + '</div>';
+            html += '<hr><h4>各音符详情</h4><div style="max-height:250px; overflow-y:auto;">';
+
+            if (result.note_results && result.note_results.length > 0) {
+                result.note_results.forEach(function(n) {
+                    var badgeClass = 'badge-good';
+                    var statusText = '✓ 正确';
+                    if (n.error_type === 'missed') {
+                        badgeClass = 'badge-error';
+                        statusText = '🔴 漏唱';
+                    } else if (n.error_type === 'pitch_error' || n.error_type === 'both_error' || n.error_type === 'rhythm_error') {
+                        badgeClass = 'badge-error';
+                        statusText = '🔴 大错误';
+                    } else if (n.error_type === 'pitch_slight' || n.error_type === 'rhythm_slight') {
+                        badgeClass = 'badge-warn';
+                        statusText = '🟡 小问题';
+                    }
+                    var dev = n.pitch_dev_cents !== null ? n.pitch_dev_cents + ' cent' : '--';
+                    var timing = n.timing_offset !== null ? (n.timing_offset * 1000).toFixed(0) + ' ms' : '--';
+                    html += '<div class="note-badge ' + badgeClass + '">';
+                    html += '<strong>' + n.pitch_name + '</strong> @' + n.start.toFixed(1) + 's ';
+                    html += statusText + ' | 音准偏差: ' + dev + ' | 节奏偏移: ' + timing;
+                    html += '</div>';
+                });
+            } else {
+                html += '<div>无音符详情</div>';
+            }
+            html += '</div>';
+
+            if (result.suggestions && result.suggestions.length > 0) {
+                html += '<div class="suggestion"><strong>💡 建议：</strong><ul>';
+                result.suggestions.forEach(function(s) {
+                    html += '<li>' + s + '</li>';
+                });
+                html += '</ul></div>';
+            }
+
+            resultContent.innerHTML = html;
+        }
+
+        // ============================================================
+        // 在五线谱SVG上标记错误
+        // ============================================================
+        function markErrorsOnScore(container, noteResults) {
+            if (!noteResults || noteResults.length === 0) return;
+            
+            const svgElements = container.querySelectorAll('svg');
+            if (svgElements.length === 0) {
+                console.warn('未找到SVG元素');
+                return;
+            }
+            
+            const svg = svgElements[0];
+            
+            let errorGroup = svg.querySelector('#error-markers');
+            if (errorGroup) {
+                errorGroup.remove();
+            }
+            
+            errorGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            errorGroup.setAttribute('id', 'error-markers');
+            svg.appendChild(errorGroup);
+            
+            const noteGroups = svg.querySelectorAll('.abcjs-note_selected, .abcjs-note');
+            const noteArray = Array.from(noteGroups);
+            
+            noteArray.sort((a, b) => {
+                const aX = a.getBoundingClientRect().x;
+                const bX = b.getBoundingClientRect().x;
+                return aX - bX;
+            });
+            
+            const actualNotes = noteArray.filter(el => {
+                return el.querySelector('path, ellipse, circle') && 
+                       !el.textContent.includes('z') &&
+                       !el.textContent.includes('rest');
+            });
+            
+            console.log('找到 ' + actualNotes.length + ' 个音符元素，需要标记 ' + noteResults.filter(n => n.error_type !== 'good').length + ' 个错误');
+            
+            let errorIndex = 0;
+            noteResults.forEach((noteResult, index) => {
+                if (noteResult.error_type === 'good' && !noteResult.is_missed) return;
+                
+                const noteEl = actualNotes[Math.min(index, actualNotes.length - 1)];
+                if (!noteEl) return;
+                
+                const bbox = noteEl.getBoundingClientRect();
+                const svgBBox = svg.getBoundingClientRect();
+                
+                const cx = bbox.left + bbox.width / 2 - svgBBox.left;
+                const cy = bbox.top + bbox.height / 2 - svgBBox.top;
+                
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', cx);
+                circle.setAttribute('cy', cy - 5);
+                circle.setAttribute('r', '6');
+                circle.setAttribute('stroke-width', '2');
+                circle.setAttribute('class', 'error-marker');
+                
+                if (noteResult.error_type === 'missed' || 
+                    noteResult.error_type === 'pitch_error' || 
+                    noteResult.error_type === 'both_error' ||
+                    noteResult.error_type === 'rhythm_error') {
+                    circle.setAttribute('fill', 'rgba(231, 76, 60, 0.3)');
+                    circle.setAttribute('stroke', '#e74c3c');
+                } else {
+                    circle.setAttribute('fill', 'rgba(243, 156, 18, 0.3)');
+                    circle.setAttribute('stroke', '#f39c12');
+                }
+                
+                errorGroup.appendChild(circle);
+                
+                const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                label.setAttribute('x', cx + 8);
+                label.setAttribute('y', cy - 10);
+                label.setAttribute('font-size', '9');
+                label.setAttribute('font-weight', 'bold');
+                label.setAttribute('class', 'error-label');
+                
+                if (noteResult.error_type === 'missed') {
+                    label.textContent = '漏';
+                    label.setAttribute('fill', '#e74c3c');
+                } else if (noteResult.error_type === 'pitch_error') {
+                    label.textContent = '音';
+                    label.setAttribute('fill', '#e74c3c');
+                } else if (noteResult.error_type === 'rhythm_error') {
+                    label.textContent = '奏';
+                    label.setAttribute('fill', '#e74c3c');
+                } else if (noteResult.error_type === 'both_error') {
+                    label.textContent = '错';
+                    label.setAttribute('fill', '#e74c3c');
+                } else if (noteResult.error_type === 'pitch_slight' || noteResult.error_type === 'rhythm_slight') {
+                    label.textContent = '~';
+                    label.setAttribute('fill', '#f39c12');
+                }
+                
+                errorGroup.appendChild(label);
+                errorIndex++;
+            });
+            
+            console.log('成功标记 ' + errorIndex + ' 个错误');
+        }
+
+        // ============================================================
+        // 事件绑定 & 初始化
+        // ============================================================
+        btnMainAction.addEventListener('click', handleMainAction);
+        btnStop.addEventListener('click', stopRecording);
+
+        loadScores();
+
+        window.addEventListener('beforeunload', function() {
+            cleanupRecording();
+        });
+
+        // ============================================================
+        // Service Worker 注册 (PWA)
+        // ============================================================
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then(reg => console.log('Service Worker 注册成功'))
+                    .catch(err => console.log('Service Worker 注册失败', err));
+            });
+        }
+    </script>
+</body>
+</html>

@@ -1,2 +1,1 @@
-# sight_singing
-sight singing evaluation web application
+sight singing evaluation web appliation
